@@ -1,6 +1,7 @@
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 
-use scale_decode::Visitor;
+use parity_scale_codec::Decode;
+use scale_decode::{visitor::DecodeAsTypeResult, Visitor};
 
 use merkleized_metadata::{
     types::{Type, TypeDef, TypeRef},
@@ -11,6 +12,18 @@ use crate::{
     decoding_commons::OutputCard,
     state::{State, StateError, StateInputCompound, StateInputCompoundItem, StateOutput},
 };
+
+/// Maximum allowed recursion depth to prevent stack overflow from deeply nested types.
+/// This protects against malicious payloads like deeply nested utility.batch calls.
+///
+/// Calculation for mobile safety (iOS secondary thread = 512KB, Android ~1MB):
+/// - Each batch nesting level uses 4 stack entries (variant, field, sequence, item)
+/// - Each level also adds approx. 2 decode_with_visitor calls to native stack
+/// - Empirically tested: 128 works safely, 256 overflows in debug builds
+/// - 128 / 4 = 32 levels of nested batch calls supported
+///
+/// This is far beyond any legitimate use case (complex governance rarely exceeds 6 levels).
+const MAX_RECURSION_DEPTH: u32 = 128;
 
 /// Implements the state machine responsible for decoding SCALE-encoded data
 /// into a human-readable format, represented as a list of output cards.
@@ -137,6 +150,72 @@ impl Visitor for StateMachineParser<'_> {
     type TypeResolver = TypeResolver;
     type Value<'scale, 'resolver> = Self;
     type Error = StateError;
+
+    /// Early bailout for types that could cause DoS.
+    ///
+    /// This method is called before the type is resolved and decoded. By returning
+    /// `DecodeAsTypeResult::Decoded(Err(...))` here, we bypass the normal decoding path
+    /// entirely, including the `skip_decoding` call that would otherwise iterate through
+    /// all elements (potentially billions of times for malicious input).
+    ///
+    /// We check for:
+    /// 1. Recursion depth - prevents stack overflow from deeply nested types
+    /// 2. Array/sequence length - prevents DoS from huge claimed lengths
+    ///
+    /// Note: Length validation assumes non-zero-sized element types (at least 1 byte per item).
+    /// Arrays or sequences with zero-sized element types (e.g., `[(); N]` or `Vec<()>`) are
+    /// not supported and will be rejected if their length exceeds available bytes.
+    fn unchecked_decode_as_type<'scale, 'resolver>(
+        self,
+        input: &mut &'scale [u8],
+        type_id: TypeRef,
+        _types: &'resolver Self::TypeResolver,
+    ) -> DecodeAsTypeResult<Self, Result<Self::Value<'scale, 'resolver>, Self::Error>> {
+        // Check recursion depth first - this prevents stack overflow from deeply nested types.
+        // We must check here (before normal decoding) because scale_decode's skip_decoding
+        // also recurses and would overflow the stack if we only checked in our visitor methods.
+        if self.stack.len() >= MAX_RECURSION_DEPTH as usize {
+            return DecodeAsTypeResult::Decoded(Err(StateError::BadInput(format!(
+                "Recursion depth {} exceeds maximum allowed {}",
+                self.stack.len(),
+                MAX_RECURSION_DEPTH
+            ))));
+        }
+
+        if let Some(ty) = self.type_registry.get_first_type(&type_id) {
+            match &ty.type_def {
+                // Each element of array or sequence requires at least 1 byte for non-zero-sized types.
+                TypeDef::Array(arr) => {
+                    if arr.len as usize > input.len() {
+                        return DecodeAsTypeResult::Decoded(Err(StateError::BadInput(format!(
+                            "Array claims {} items but only {} bytes remain",
+                            arr.len,
+                            input.len()
+                        ))));
+                    }
+                }
+                TypeDef::Sequence(_) => {
+                    // Peek at the compact-encoded length without consuming bytes
+                    let mut peek_input = *input;
+                    if let Ok(parity_scale_codec::Compact(claimed_len)) =
+                        <parity_scale_codec::Compact<u32>>::decode(&mut peek_input)
+                    {
+                        let remaining_bytes = peek_input.len();
+                        if claimed_len as usize > remaining_bytes {
+                            return DecodeAsTypeResult::Decoded(Err(StateError::BadInput(
+                                format!(
+                                    "Sequence claims {} items but only {} bytes remain",
+                                    claimed_len, remaining_bytes
+                                ),
+                            )));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        DecodeAsTypeResult::Skipped(self)
+    }
 
     fn visit_bool<'scale, 'resolver>(
         mut self,
@@ -327,10 +406,14 @@ impl Visitor for StateMachineParser<'_> {
     ) -> Result<Self::Value<'scale, 'resolver>, Self::Error> {
         let mut visitor = self;
 
-        let path = visitor
-            .type_registry
-            .get_first_type(&type_id)
-            .map(|v| v.path);
+        let seq_type = visitor.type_registry.get_first_type(&type_id);
+        let path = seq_type.as_ref().map(|v| v.path.clone());
+
+        // Extract item type from sequence's TypeDef to avoid using iterator which pre-decodes with IgnoreVisitor
+        let item_type_id = seq_type.and_then(|ty| match &ty.type_def {
+            TypeDef::Sequence(inner_type) => Some(*inner_type),
+            _ => None,
+        });
 
         let items_count = value.remaining();
 
@@ -347,14 +430,14 @@ impl Visitor for StateMachineParser<'_> {
         let output = visitor.state.process_sequence(&input, visitor.indent)?;
         visitor.apply(output);
 
-        for (index, field_result) in value.enumerate() {
-            visitor.push_indent();
+        // Get item path once (all items have the same type in a sequence)
+        let item_path = item_type_id
+            .as_ref()
+            .and_then(|id| visitor.type_registry.get_first_type(id))
+            .map(|v| v.path);
 
-            let field = field_result.clone()?;
-            let item_path = visitor
-                .type_registry
-                .get_first_type(field.type_id())
-                .map(|v| v.path);
+        for index in 0..items_count {
+            visitor.push_indent();
 
             let input = StateInputCompoundItem {
                 index,
@@ -370,7 +453,10 @@ impl Visitor for StateMachineParser<'_> {
                 .process_sequence_item(&input, visitor.indent)?;
             visitor.apply(output);
 
-            visitor = field_result?.decode_with_visitor(visitor)?;
+            // Use decode_item directly instead of iterator to avoid IgnoreVisitor pre-decoding
+            visitor = value
+                .decode_item(visitor)
+                .ok_or_else(|| StateError::BadInput("Unexpected end of sequence".into()))??;
 
             visitor.pop_indent();
         }
@@ -415,17 +501,22 @@ impl Visitor for StateMachineParser<'_> {
         let output = visitor.state.process_composite(&input, visitor.indent)?;
         visitor.apply(output);
 
-        while let Some((index, field_result)) = value.enumerate().next() {
+        // Extract field metadata upfront to avoid using the iterator which pre-decodes with IgnoreVisitor.
+        let field_infos: Vec<_> = value
+            .fields()
+            .iter()
+            .map(|f| (f.name.map(|s| s.to_string()), f.id))
+            .collect();
+
+        for (index, (field_name, field_type_id)) in field_infos.into_iter().enumerate() {
             visitor.push_indent();
 
-            let field = field_result?;
-            let field_name = field.name().map(|name| name.to_string());
             let type_name = visitor
                 .type_registry
                 .get_composite_field_type_name(&type_id, index);
             let field_path = visitor
                 .type_registry
-                .get_first_type(field.type_id())
+                .get_first_type(&field_type_id)
                 .map(|v| v.path);
 
             let input = StateInputCompoundItem {
@@ -440,7 +531,10 @@ impl Visitor for StateMachineParser<'_> {
             let output = visitor.state.process_field(&input, visitor.indent)?;
             visitor.apply(output);
 
-            visitor = field.decode_with_visitor(visitor)?;
+            // Use decode_item directly instead of iterator to avoid IgnoreVisitor pre-decoding
+            visitor = value
+                .decode_item(visitor)
+                .ok_or_else(|| StateError::BadInput("Unexpected end of items".into()))??;
 
             visitor.pop_indent();
         }
@@ -457,10 +551,16 @@ impl Visitor for StateMachineParser<'_> {
     ) -> Result<Self::Value<'scale, 'resolver>, Self::Error> {
         let mut visitor = self;
 
-        let path = visitor
-            .type_registry
-            .get_first_type(&type_id)
-            .map(|v| v.path);
+        let tuple_type = visitor.type_registry.get_first_type(&type_id);
+        let path = tuple_type.as_ref().map(|v| v.path.clone());
+
+        // Extract item type refs from tuple's TypeDef to avoid using iterator which pre-decodes with IgnoreVisitor
+        let item_type_refs: Vec<TypeRef> = tuple_type
+            .and_then(|ty| match ty.type_def {
+                TypeDef::Tuple(refs) => Some(refs),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         let items_count = value.remaining();
 
@@ -479,21 +579,21 @@ impl Visitor for StateMachineParser<'_> {
             .process_tuple(&input, visitor.indent)?;
         visitor.apply(output);
 
-        for (index, field_result) in value.enumerate() {
+        // Use decode_item directly instead of iterator to avoid IgnoreVisitor pre-decoding
+        for index in 0..items_count {
             visitor.push_indent();
 
-            let field = field_result?;
-            let item_path = visitor
-                .type_registry
-                .get_first_type(field.type_id())
-                .map(|v| v.path);
+            let item_path = item_type_refs
+                .get(index)
+                .and_then(|type_ref| visitor.type_registry.get_first_type(type_ref))
+                .map(|ty| ty.path);
 
             let input = StateInputCompoundItem {
                 index,
                 name: None,
                 path: &item_path,
                 extra_info: visitor.extra_info.clone(),
-                type_name: None,
+                type_name: item_path.as_ref().and_then(|p| p.last()).cloned(),
                 items_count,
             };
 
@@ -502,7 +602,9 @@ impl Visitor for StateMachineParser<'_> {
                 .process_tuple_item(&input, visitor.indent)?;
             visitor.apply(output);
 
-            visitor = field.decode_with_visitor(visitor)?;
+            visitor = value
+                .decode_item(visitor)
+                .ok_or_else(|| StateError::BadInput("Unexpected end of tuple items".into()))??;
 
             visitor.pop_indent();
         }
@@ -542,11 +644,18 @@ impl Visitor for StateMachineParser<'_> {
             .process_variant(&input, visitor.indent)?;
         visitor.apply(output);
 
-        for (index, field_result) in value.fields().enumerate() {
+        // Extract field metadata upfront to avoid using the iterator which pre-decodes with IgnoreVisitor.
+        // This prevents stack overflow when decoding deeply nested types.
+        let field_infos: Vec<_> = value
+            .fields()
+            .fields()
+            .iter()
+            .map(|f| (f.name.map(|s| s.to_string()), f.id))
+            .collect();
+
+        for (index, (field_name, field_type_id)) in field_infos.into_iter().enumerate() {
             visitor.push_indent();
 
-            let field = field_result?;
-            let field_name = field.name().map(|name| name.to_string());
             let type_name = visitor.type_registry.get_enum_field_type_name(
                 &type_id,
                 variant_index as u32,
@@ -555,7 +664,7 @@ impl Visitor for StateMachineParser<'_> {
 
             let field_path = visitor
                 .type_registry
-                .get_first_type(field.type_id())
+                .get_first_type(&field_type_id)
                 .map(|v| v.path);
 
             let input = StateInputCompoundItem {
@@ -572,7 +681,11 @@ impl Visitor for StateMachineParser<'_> {
                 .process_field(&input, visitor.indent)?;
             visitor.apply(output);
 
-            visitor = field.decode_with_visitor(visitor)?;
+            // Use decode_item directly instead of iterator to avoid IgnoreVisitor pre-decoding
+            visitor = value
+                .fields()
+                .decode_item(visitor)
+                .ok_or_else(|| StateError::BadInput("Unexpected end of fields".into()))??;
 
             visitor.pop_indent();
         }
@@ -589,10 +702,14 @@ impl Visitor for StateMachineParser<'_> {
     ) -> Result<Self::Value<'scale, 'resolver>, Self::Error> {
         let mut visitor = self;
 
-        let path = visitor
-            .type_registry
-            .get_first_type(&type_id)
-            .map(|v| v.path);
+        let arr_type = visitor.type_registry.get_first_type(&type_id);
+        let path = arr_type.as_ref().map(|v| v.path.clone());
+
+        // Extract item type from array's TypeDef to avoid using iterator which pre-decodes with IgnoreVisitor
+        let item_type_id = arr_type.and_then(|ty| match &ty.type_def {
+            TypeDef::Array(arr) => Some(arr.type_param),
+            _ => None,
+        });
 
         let items_count = value.remaining();
 
@@ -611,14 +728,15 @@ impl Visitor for StateMachineParser<'_> {
             .process_array(&input, visitor.indent)?;
         visitor.apply(output);
 
-        for (index, field) in value.enumerate() {
-            visitor.push_indent();
+        // Get item path once (all items have the same type in an array)
+        let item_path = item_type_id
+            .as_ref()
+            .and_then(|id| visitor.type_registry.get_first_type(id))
+            .map(|v| v.path);
 
-            let field_result = field.clone()?;
-            let item_path = visitor
-                .type_registry
-                .get_first_type(field_result.type_id())
-                .map(|v| v.path);
+        // Use decode_item directly instead of iterator to avoid IgnoreVisitor pre-decoding
+        for index in 0..items_count {
+            visitor.push_indent();
 
             let input = StateInputCompoundItem {
                 index,
@@ -634,7 +752,9 @@ impl Visitor for StateMachineParser<'_> {
                 .process_array_item(&input, visitor.indent)?;
             visitor.apply(output);
 
-            visitor = field?.decode_with_visitor(visitor)?;
+            visitor = value
+                .decode_item(visitor)
+                .ok_or_else(|| StateError::BadInput("Unexpected end of array items".into()))??;
 
             visitor.pop_indent();
         }
