@@ -15,7 +15,7 @@ android {
 		applicationId "io.parity.signer"
 		minSdk 23
 		targetSdk 35
-		versionCode 70300
+		versionCode 70301
 		versionName "7.3.0"
 		ndk {
 			abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
